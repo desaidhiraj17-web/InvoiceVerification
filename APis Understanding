@@ -1,0 +1,27 @@
+1] Get api Of Invoice Listing:
+
+      if is_verified is True:
+      	type == FlowType.picker
+          		i.status = picking_end
+      		i.is_completed = 1 or True
+      	type == FlowType.checker
+      		i.status = checking_end
+      		i.is_completed = 1 or True
+      elif is_verified is False:
+                  if type == FlowType.picker:
+                      status_values = ("not_started","picking_start") should not have is_completed True
+                  else:  # checker
+                      status_values = ("not_started","checking_start",) should not have is_completed True
+      
+      
+      if is_verified is None:
+      	if type == FlowType.picker:
+                      group1 = ("not_started", "picking_start", "checking_start", "checking_end") should not have is_completed True
+      		group2 = ("is_completed")
+                      group3 = ("picking_end")
+      		
+              else:  # checker
+                      group1 = ("not_started", "checking_start", "picking_start", "picking_end") should not have is_completed True
+      		group2 = ("is_completed")
+                      group3 = ("checking_end")
+      
