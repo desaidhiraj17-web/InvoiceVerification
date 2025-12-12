@@ -9,6 +9,7 @@ from datetime import datetime
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, Tuple, List
+from src.helpers.invoices import FlowType
 
 class Finder:
     """
@@ -221,19 +222,15 @@ class Finder:
         # 1 Try direct batch search
         await self.find_products_by_batch()
 
-        print("products found 0",self.__products)
         # 2 If none found, try fuzzy search
         if not self.__products:
-            print("products found",self.__products)
             tmp_products = await self.find_products_by_fuzzy_logic()
             logger.info(f"products found using find_products_by_fuzzy_logic: {len(tmp_products)}")
-            print("tmp_products",tmp_products)
             if not tmp_products:
                 tmp_products = await self.find_products_by_fuzzy_logic(skip_mfg=True)
                 logger.info(f"products found without using mfg find_products_by_fuzzy_logic: {len(tmp_products)}")
             self.__products = tmp_products
 
-        print("products found 2",self.__products)
         if not self.__products:
             logger.debug("No products found even after fuzzy search")
             return []
@@ -246,15 +243,11 @@ class Finder:
 
         if self.__mrp:
             mrp_filtered = self.filter_by_mrp()
-            print(f"After MRP filter: {len(mrp_filtered)} products")
             logger.debug(f"After MRP filter: {len(mrp_filtered)} products")
-        
-        print("after mrp finding",self.__products)
-        
+                
         if (not mrp_filtered or len(mrp_filtered)>5) and self.__expiry_date:
             
             expiry_filtered = self.filter_by_expiry()
-            print(f"After expiry filter: {len(expiry_filtered)} products")
             logger.debug(f"After expiry filter: {len(expiry_filtered)} products")
         
         if mrp_filtered or expiry_filtered:
@@ -536,8 +529,16 @@ async def update_product_qty_converter(db,data,existing_product):
 #             detail={"status": "error", "message": str(e).split("\n")[0][:100]},
 #         )
 
-async def scan_quantity_update_products(db,invoice_id,product,current_user):
+async def scan_quantity_update_products(db,invoice_id,product,flow_type, current_user):
     try:
+        
+        if flow_type == FlowType.picker:
+            scan_qty_key = "picker_scanned_qty"
+            scan_status_key = "picker_scan_status"
+        else:
+            scan_qty_key = "checker_scanned_qty"
+            scan_status_key = "checker_scan_status"
+        
         # Check if product exists in product_qty_converter
         check_query = text("""
             SELECT id, shipper_val, box_val, strip_val
@@ -555,10 +556,10 @@ async def scan_quantity_update_products(db,invoice_id,product,current_user):
             await update_product_qty_converter(db,product,existing_product)
 
         # Update scanned_qty in invoice_product_list
-        update_invoice_query = text("""
+        update_invoice_query = text(f"""
             UPDATE invoice_product_list
-            SET scanned_qty = :scanned_qty, 
-            scan_status = :scan_status
+            SET {scan_qty_key} = :scanned_qty, 
+            {scan_status_key} = :scan_status
             WHERE id = :product_id
             AND invoice_id = :invoice_id
             AND product_name = :product_name

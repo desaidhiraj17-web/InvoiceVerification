@@ -17,6 +17,9 @@ router = APIRouter(tags=["Authentication"])
 
 @router.post("/login")
 async def login(credentials: LoginUser, db: AsyncSession = Depends(get_db)):
+    """Authenticates user via central login server and validates existence in local database.
+    Creates a new user locally if not found and returns JWT access and refresh tokens.
+    Returns appropriate error message if authentication fails at the central server."""
     try:
         logger.info("login api started")
         hashed_password,provider, data= await central_login(credentials)
@@ -95,6 +98,8 @@ async def login(credentials: LoginUser, db: AsyncSession = Depends(get_db)):
         data["data"]["email"] = new_user.email
         logger.info("Successfully run login api")
         return data
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Error in login api: {e}")
         raise HTTPException(status_code=400, detail={"status" : "error",
@@ -104,9 +109,7 @@ async def login(credentials: LoginUser, db: AsyncSession = Depends(get_db)):
 @router.post("/register")
 async def register(data: RegisterUserSchema, db: AsyncSession = Depends(get_db)):
     try:
-        # await check_email_exists(db,data.email1)
-        # if data.email2:
-        #     await check_email_exists(db,data.email2)
+        """ Register user on central server"""
             
         headers = {"Content-Type": "application/json"}
 
@@ -140,6 +143,10 @@ async def refresh_access_token(
     payload: RefreshTokenRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    Return refresh token that is generated from access token.
+    If refresh token is also expired then send appropriate error message.
+    """
     try:
         decoded_token = await decode_refresh_token(payload.refresh_token)
 

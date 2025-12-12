@@ -12,6 +12,10 @@ class FileUploadType(str, Enum):
     product_master = "product_master"
     rack_master = "rack_master"
     tray_master = "tray_master"
+    
+class FlowType(str, Enum):
+    picker = "picker"
+    checker = "checker"
      
     
 def list_invoices_base_query():
@@ -22,7 +26,7 @@ def list_invoices_base_query():
             i.invoice_date,
             i.priority,
             i.status,
-
+            i.is_completed,
             
             p.id,
             p.party_code,
@@ -51,6 +55,7 @@ def invoices_return_structure(rows):
                     "invoice_date": row["invoice_date"],
                     "priority": row["priority"],
                     "status": row["status"],
+                    "is_completed": bool(row["is_completed"]),
                     "party": {
                         "party_code": row["party_code"],
                         "party_name": row["party_name"],
@@ -65,8 +70,16 @@ def invoices_return_structure(rows):
                 "message" : str(e).split("\n")[0][:100]})
 
 
-def list_invoices_products_base_query(rack_no: str | None = None):
-    base_query = """
+def list_invoices_products_base_query(flow_type: FlowType,rack_no: str | None = None):
+    
+    if flow_type == FlowType.picker:
+        scan_qty_col = "ip.picker_scanned_qty AS scanned_qty"
+        scan_status_col = "ip.picker_scan_status AS scan_status"
+    else:
+        scan_qty_col = "ip.checker_scanned_qty AS scanned_qty"
+        scan_status_col = "ip.checker_scan_status AS scan_status"
+        
+    base_query = f"""
         SELECT 
             ip.id AS product_id,
             ip.product_name,
@@ -74,9 +87,9 @@ def list_invoices_products_base_query(rack_no: str | None = None):
             ip.expiry_date,
             ip.mrp,
             ip.actual_qty,
-            ip.scanned_qty,
+            {scan_qty_col},
             ip.rack_no,
-            ip.scan_status,
+            {scan_status_col},
             shipper_val AS shipper_uom,
             box_val AS box_uom,
             strip_val AS strip_uom,
@@ -205,25 +218,68 @@ invoice_product_list_insert_query="""
         )
         """
         
-async def update_invoice_status(db,invoice_id,status,now_str):
+async def update_invoice_status(db,invoice_id,new_status,now_str):
     try:
-
-        update_invoice_status_query = """
-            UPDATE invoices
-            SET status = :status,
-                updated_at = :updated_at
+        current_status_query = """
+            SELECT status, is_completed
+            FROM invoices
             WHERE id = :invoice_id
         """
+        result = await db.execute(
+            text(current_status_query),
+            {"invoice_id": invoice_id}
+        )
+        row = result.fetchone()
+
+        old_status = row.status
+        already_completed = row.is_completed
+        set_completed = False
+        
+        # : BLOCK invalid backward transitions
+        invalid_transitions = {
+            "picking_end": {"checking_start", "not_started"},
+            "checking_end": {"picking_start", "not_started"}
+        }
+
+        if old_status in invalid_transitions and new_status in invalid_transitions[old_status]:
+            logger.warning(
+                f"Status update blocked for invoice {invoice_id}: "
+                f"{old_status} → {new_status} not allowed."
+            )
+            return    
+        
+        
+        if old_status in ("picking_end", "checking_end") and \
+            new_status in ("picking_end", "checking_end") and \
+            old_status != new_status:
+            set_completed = True
+             
+        if set_completed and not already_completed:
+            update_invoice_status_query = """
+                UPDATE invoices
+                SET status = :new_status,
+                    updated_at = :updated_at,
+                    is_completed = 1
+                WHERE id = :invoice_id
+            """
+        else:
+        
+            update_invoice_status_query = """
+                UPDATE invoices
+                SET status = :new_status,
+                    updated_at = :updated_at
+                WHERE id = :invoice_id
+            """
 
         await db.execute(
             text(update_invoice_status_query),
             {
-                "status": status,
+                "new_status": new_status,
                 "updated_at": now_str,
                 "invoice_id": invoice_id
             }
         )
-        logger.info(f"Invoice {invoice_id} status updated to {status}")
+        logger.info(f"Invoice {invoice_id} status updated to {new_status}")
     except Exception as e:
         logger.exception(f"Inside scan_quantity_update_products: {e}")
         raise HTTPException(

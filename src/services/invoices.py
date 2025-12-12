@@ -10,7 +10,7 @@ from sqlalchemy import select
 from src.models.invoices import Invoice, InvoiceStatus
 from src.models.parties import PartyMaster
 from src.logger.logger_setup import logger
-from src.helpers.invoices import parse_expiry_or_mfg_date, invoice_upload_date_format, epoch_to_str, invoices_metadata_field_map
+from src.helpers.invoices import FlowType,parse_expiry_or_mfg_date, invoice_upload_date_format, epoch_to_str, invoices_metadata_field_map
 from src.models.invoices import ScanStatusEnum
 import statistics
 from src.schemas.invoices import InvoiceMetadataUpdateSchema
@@ -21,21 +21,41 @@ async def read_csv_file(file):
     try:
         if not file.filename.lower().endswith(".csv"):
             logger.error("Only CSV files are allowed")
-            raise HTTPException(status_code=400, detail={"message":"Only CSV files are allowed"})
+            raise HTTPException(status_code=400, detail={"status":"error","message":"Only CSV files are allowed"})
 
         # Read file content asynchronously
         content = await file.read()
 
-        # Convert bytes → string (UTF-8)
-        decoded_content = content.decode("utf-8")
+        decoded_content = None
+        
+        try:
+            # Convert bytes → string (UTF-8)
+            decoded_content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                decoded_content = content.decode("windows-1252")
+            except UnicodeDecodeError:
+                try:
+                    decoded_content = content.decode("iso-8859-1")
+                except UnicodeDecodeError:
+                    logger.error("CSV file encoding is not supported (utf-8 / windows-1252 / iso-8859-1)")
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"status": "error", 
+                                "message": "CSV file encoding is not supported (utf-8 / windows-1252 / iso-8859-1)"}
+                    )
 
         # Parse CSV
         reader = csv.DictReader(io.StringIO(decoded_content))
-        rows = list(reader)
-
+        raw_rows = list(reader)
+        
+        rows = [
+            row for row in raw_rows
+            if any(value and str(value).strip() for value in row.values())
+        ]
         if not rows:
             logger.error("CSV file is empty")
-            raise HTTPException(status_code=400, detail={"message":"CSV file is empty"})
+            raise HTTPException(status_code=400, detail={"status":"error","message":"CSV file is empty"})
         
         return rows
     except HTTPException:
@@ -112,8 +132,11 @@ async def invoice_product_data_handling(db,product_rows_map,row,invoice_id,expir
             "expiry_date": expiry_date,
             "mrp": mrp,
             "actual_qty": qty,
-            "scanned_qty": 0.0,
+            "picker_scanned_qty" : 0.0 ,
+            "checker_scanned_qty" : 0.0
         }
+            
+        
         product_rows_map[product_key] = product_data
         return product_data
     
@@ -151,15 +174,15 @@ async def prepare_invoice_upload_data(db,rows,current_user):
         # existing_invoices = {inv_no: {"id": iid, "status": status} for inv_no, iid, status in existing_invoices.all()}
         # Load existing invoices
         existing_invoices_query = """
-            SELECT invoice_no, id, status
+            SELECT invoice_no, id, status,is_completed
             FROM invoices;
         """
         result = await db.execute(text(existing_invoices_query))
         existing_invoices = {
-            row.invoice_no: {"id": row.id, "status": row.status}
+            row.invoice_no: {"id": row.id, "status": row.status,"is_completed":row.is_completed}
             for row in result.mappings().all()
         }
-        
+
         for row in rows:
             party_code = row.get("party_id")
             invoice_no = row.get("invoice_no")
@@ -196,9 +219,9 @@ async def prepare_invoice_upload_data(db,rows,current_user):
             if invoice_no in existing_invoices:
                 invoice_info = existing_invoices[invoice_no]
                 allowed_status = [None, "", "not_started"]
-                if invoice_info["status"] not in allowed_status:
-                    logger.error(f"Invoice {invoice_no} already {invoice_info['status']} — cannot override.")
-                    raise HTTPException(status_code=400, detail={"status":"error","message":f"Invoice {invoice_no} already {invoice_info['status']} — cannot override."})
+                if invoice_info["status"] not in allowed_status or invoice_info["is_completed"] == True:
+                    logger.error(f"Invoice {invoice_no} already {invoice_info['status']} is_completed:{invoice_info['is_completed']} — cannot override.")
+                    raise HTTPException(status_code=400, detail={"status":"error","message":f"Invoice {invoice_no} already {invoice_info['status']} is_completed:{invoice_info['is_completed']} — cannot override."})
 
                 # If not checked → override
                 invoice_id = invoice_info["id"]
@@ -212,6 +235,7 @@ async def prepare_invoice_upload_data(db,rows,current_user):
                     "party_id": party_id,
                     "priority": "LOW",
                     "status": "not_started",
+                    "is_completed":False,
                     "created_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
                     "started_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
                     "updated_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
@@ -230,6 +254,7 @@ async def prepare_invoice_upload_data(db,rows,current_user):
                 "party_id": party_id,
                 "priority": "LOW",
                 "status": "not_started",
+                "is_completed":False,
                 "created_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
                 "started_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
                 "updated_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S")
@@ -300,13 +325,14 @@ async def save_invoice_upload_data(db,party_rows, invoice_rows, product_rows):
         if invoice_rows:
             await db.execute(
                 text("""
-                    INSERT INTO invoices (id, invoice_no, invoice_type,invoice_date, party_id, priority, status, created_at, updated_at, started_at)
-                    VALUES (:id, :invoice_no, :invoice_type, :invoice_date, :party_id, :priority, :status, :created_at, :updated_at, :started_at)
+                    INSERT INTO invoices (id, invoice_no, invoice_type,invoice_date, party_id, priority, status, is_completed, created_at, updated_at, started_at)
+                    VALUES (:id, :invoice_no, :invoice_type, :invoice_date, :party_id, :priority, :status, :is_completed, :created_at, :updated_at, :started_at)
                     ON CONFLICT (id) DO UPDATE SET
                         invoice_date = EXCLUDED.invoice_date,
                         party_id = EXCLUDED.party_id,
                         priority = EXCLUDED.priority,
                         status = EXCLUDED.status,
+                        is_completed = EXCLUDED.is_completed,
                         updated_at = EXCLUDED.updated_at,
                         created_at = EXCLUDED.created_at,
                         started_at = EXCLUDED.started_at
@@ -318,8 +344,8 @@ async def save_invoice_upload_data(db,party_rows, invoice_rows, product_rows):
             await db.execute(
                 text("""
                     INSERT INTO invoice_product_list 
-                    (id, invoice_id, product_name, batch_number, expiry_date, mrp, actual_qty, scanned_qty, rack_no)
-                    VALUES (:id, :invoice_id, :product_name, :batch_number, :expiry_date, :mrp, :actual_qty, :scanned_qty, :rack_no)
+                    (id, invoice_id, product_name, batch_number, expiry_date, mrp, actual_qty, picker_scanned_qty, checker_scanned_qty, rack_no)
+                    VALUES (:id, :invoice_id, :product_name, :batch_number, :expiry_date, :mrp, :actual_qty, :picker_scanned_qty, :checker_scanned_qty, :rack_no)
                 """), product_rows_add
             )
         await db.commit()
@@ -328,13 +354,71 @@ async def save_invoice_upload_data(db,party_rows, invoice_rows, product_rows):
         logger.exception(f"in save_invoice_upload_data function: {e}")
         raise HTTPException(status_code=400, detail={"status" : "error",
                 "message" : str(e).split("\n")[0][:100]})
+        
+
+def sqlite_ddmmyyyy_to_yyyymmdd(expr: str) -> str:
+    """
+    Converts DD-MM-YYYY string column into YYYY-MM-DD format for SQLite comparisons
+    """
+    return f"""
+        substr({expr}, 7, 4) || '-' ||
+        substr({expr}, 4, 2) || '-' ||
+        substr({expr}, 1, 2)
+    """
+    
+def py_ddmmyyyy_to_yyyymmdd(date_str: str) -> str:
+    return datetime.strptime(date_str, "%d-%m-%Y").strftime("%Y-%m-%d")
 
 
+def invoices_apply_date_range_filter(filters,params,from_date,to_date):
+    try:
+        invoice_date_expr = sqlite_ddmmyyyy_to_yyyymmdd("i.invoice_date")
+        if from_date and to_date:
+            filters.append(f"""
+                ({invoice_date_expr}
+                BETWEEN :from_date AND :to_date)
+            """)
+            params["from_date"] = py_ddmmyyyy_to_yyyymmdd(from_date)
+            params["to_date"] = py_ddmmyyyy_to_yyyymmdd(to_date)
+                
+        elif from_date:
+            print("inside from_date")
+            filters.append(f"""
+                {invoice_date_expr}
+                >= :from_date
+            """)
+            params["from_date"] = py_ddmmyyyy_to_yyyymmdd(from_date)
 
-async def invoices_apply_filters_search_pagination(db,base_query,search,priority,page,page_size):
+        # Only to_date → invoice_date <= to_date
+        elif to_date:
+            filters.append(f"""
+                {invoice_date_expr}
+                <= :to_date
+            """)
+            params["to_date"] = py_ddmmyyyy_to_yyyymmdd(to_date)
+            
+        return filters,params
+    except Exception as e:
+        logger.exception(f"in invoices_apply_date_range_filter function {e}")
+        raise HTTPException(status_code=400, detail={"status" : "error",
+                "message" : str(e).split("\n")[0][:100]})
+        
+
+def build_in_filter(field_name: str, values: tuple, param_prefix: str, params: dict):
+    placeholders = []
+    for idx, val in enumerate(values):
+        key = f"{param_prefix}_{idx}"
+        placeholders.append(f":{key}")
+        params[key] = val
+    return f"{field_name} IN ({','.join(placeholders)})"
+    
+
+async def invoices_apply_filters_search_pagination(type,db,base_query,search,priority, from_date, to_date, is_verified,page,page_size):
     try:
         filters = []
         params = {}
+        
+        filters,params=invoices_apply_date_range_filter(filters,params,from_date,to_date)
         
         if search:
             filters.append("(i.invoice_no LIKE :search OR p.party_code LIKE :search OR p.party_name LIKE :search)")
@@ -347,10 +431,7 @@ async def invoices_apply_filters_search_pagination(db,base_query,search,priority
                 }
         
         if priority is not None:
-            # filters.append("i.priority = :priority")
-            # params["priority"] = priority
             try:
-
                 priority_value = priority_map.get(int(priority))
                 filters.append("i.priority = :priority")
                 params["priority"] = priority_value
@@ -358,6 +439,26 @@ async def invoices_apply_filters_search_pagination(db,base_query,search,priority
             except (ValueError, KeyError):
                 logger.error("in apply_filters_search_pagination function: Invalid priority value")
                 raise HTTPException(status_code=400, detail={"status":"error","message":"Invalid priority value"})
+            
+        # Verified status logic
+        if is_verified is True:
+            if type == FlowType.picker:
+                final_status = "picking_end"
+            else:  # checker
+                final_status = "checking_end"
+            filters.append(f"(i.status = '{final_status}' OR i.is_completed = 1)")
+            # in_filter = build_in_filter("i.status", status_values, "verified", params)
+            # filters.append(in_filter)
+            
+        elif is_verified is False:
+            filters.append("i.is_completed = 0")
+            if type == FlowType.picker:
+                status_values = ("not_started","picking_start")
+            else:  # checker
+                status_values = ("not_started","checking_start",)
+            
+            in_filter = build_in_filter("i.status", status_values, "unverified", params)
+            filters.append(in_filter)
 
         query_with_filters = base_query
 
@@ -369,28 +470,51 @@ async def invoices_apply_filters_search_pagination(db,base_query,search,priority
         total_result = await db.execute(text(count_query), params)
         total = total_result.scalar_one() 
             
-            
         offset = (page - 1) * page_size
 
-        # query_with_filters += " ORDER BY i.priority ASC LIMIT :limit OFFSET :offset"
-        query_with_filters += """
-            ORDER BY CASE i.priority
-                        WHEN 'HIGH' THEN 1
-                        WHEN 'MEDIUM' THEN 2
-                        WHEN 'LOW' THEN 3
-                    END ASC
-            LIMIT :limit OFFSET :offset
-        """
+        if is_verified is None:
+            if type == FlowType.picker:
+                group1_status = ("not_started", "picking_start", "checking_start", "checking_end")
+                group3_last = "picking_end"
+            else:  # checker
+                group1_status = ("not_started", "checking_start", "picking_start", "picking_end")
+                group3_last = "checking_end"
+                
+            query_with_filters += f"""
+                ORDER BY
+                CASE
+                    WHEN i.is_completed = 0 AND i.status IN {group1_status} THEN 1
+                    WHEN i.is_completed = 1 THEN 2
+                    WHEN i.is_completed = 0 AND i.status = '{group3_last}' THEN 3
+                    ELSE 4
+                END,
+                CASE i.priority
+                    WHEN 'HIGH' THEN 1
+                    WHEN 'MEDIUM' THEN 2
+                    WHEN 'LOW' THEN 3
+                END
+            """
+        else:
+            #  Verified-only OR Unverified-only → just sort by priority
+            query_with_filters += """
+                ORDER BY CASE i.priority
+                    WHEN 'HIGH' THEN 1
+                    WHEN 'MEDIUM' THEN 2
+                    WHEN 'LOW' THEN 3
+                END
+            """
+        
+        query_with_filters += " LIMIT :limit OFFSET :offset"
         params["limit"] = page_size
         params["offset"] = offset
         
-
         query = text(query_with_filters)
         result = await db.execute(query, params)
         rows = result.mappings().all()
         logger.info("apply_filters_search_pagination function runs successfully")
         return (rows,total)
-    
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"in apply_filters_search_pagination function {e}")
         raise HTTPException(status_code=400, detail={"status" : "error",
@@ -771,10 +895,17 @@ async def invoice_product_check(db,invoice_id,data):
             detail={"status": "error", "message": str(e).split("\n")[0][:100]},
         )
   
-async def add_invoice_product(db,invoice_id,data):
+async def add_invoice_product(db,invoice_id,data,flow_type:FlowType):
     try:
         await invoice_product_check(db,invoice_id,data)
-    
+
+        if flow_type == FlowType.picker:
+            scan_qty_key = "picker_scanned_qty"
+            scan_status_key = "picker_scan_status"
+        else:
+            scan_qty_key = "checker_scanned_qty"
+            scan_status_key = "checker_scan_status"
+        
         product_rows= [{"id": str(uuid.uuid4()),
             "invoice_id": invoice_id,
             "product_name": data.product_name.strip(),
@@ -782,19 +913,33 @@ async def add_invoice_product(db,invoice_id,data):
             "expiry_date": data.expiry_date,
             "mrp": round(float(data.mrp or 0), 2),
             "actual_qty": data.actual_qty,
-            "scanned_qty": data.scanned_qty,
-            "scan_status": data.scan_status.value if data.scan_status else None  
+            
+            scan_qty_key: data.scanned_qty,
+            scan_status_key: data.scan_status.value if data.scan_status else None 
         }]
+        row = product_rows[0]
+        row.setdefault("picker_scanned_qty", None)
+        row.setdefault("picker_scan_status", None)
+        row.setdefault("checker_scanned_qty", None)
+        row.setdefault("checker_scan_status", None)
+        
         product_rows_add = await invoices_products_assign_rack_no(db,product_rows)
         final_product = product_rows_add[0]
         insert_query = """
             INSERT INTO invoice_product_list 
-            (id, invoice_id, product_name, batch_number, expiry_date, mrp, actual_qty, scanned_qty, rack_no, scan_status)
-            VALUES (:id, :invoice_id, :product_name, :batch_number, :expiry_date, :mrp, :actual_qty, :scanned_qty, :rack_no, :scan_status)
+            (id, invoice_id, product_name, batch_number, expiry_date, mrp, actual_qty, rack_no,
+            picker_scanned_qty, picker_scan_status,
+            checker_scanned_qty, checker_scan_status
+            )
+            VALUES (:id, :invoice_id, :product_name, :batch_number, :expiry_date, :mrp, :actual_qty, :rack_no, 
+            :picker_scanned_qty, :picker_scan_status,
+            :checker_scanned_qty, :checker_scan_status)
         """
         
         await db.execute(text(insert_query), product_rows_add)
         await db.commit()
+        final_product["scanned_qty"] = final_product.get(scan_qty_key)
+        final_product["scan_status"] = final_product.get(scan_status_key)
         return final_product
     except HTTPException:
         raise
@@ -1313,7 +1458,6 @@ async def compute_performance_metrics(db,invoice_id,data,operation_status):
         """)
         txn_result = await db.execute(txn_count_query, {"invoice_id": invoice_id,"operation_status":operation_status})
         transaction_count = txn_result.scalar() or 0
-        
         time_in_seconds = calculate_seconds_diff(invoice_start_time, invoice_end_time)
         
         timestamps = await get_transaction_timestamps(db, invoice_id,operation_status)

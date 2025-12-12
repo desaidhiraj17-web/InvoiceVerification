@@ -16,7 +16,7 @@ from src.services.invoices import read_csv_file, invoices_apply_filters_search_p
 from src.services.user_services import get_current_user
 
 #  *****************  Helpers Import  *******************
-from src.helpers.invoices import FileUploadType, list_invoices_base_query, invoices_return_structure, list_invoices_products_base_query, \
+from src.helpers.invoices import FileUploadType, FlowType,list_invoices_base_query, invoices_return_structure, list_invoices_products_base_query, \
             check_invoice_exists, check_duplicate_csv_product_master,update_invoice_status, epoch_to_str,check_invoice_metadata_fields_exist, \
             invoices_metadata_field_map , invoice_metadata_row_exists, check_invoice_product_exists
             
@@ -39,7 +39,11 @@ async def file_upload(db: AsyncSession = Depends(get_db),
                     file:UploadFile = File(...), 
                     value: FileUploadType = Form(...),
                     current_user: User = Depends(get_current_user)):
-    
+
+    """ Uploads and processes CSV files for Invoice, Party Master, Product Master, Rack Master, and Tray Master.
+        Product Master file must be uploaded before Invoice upload to ensure proper rack mapping.
+        Validates, prepares, and stores data based on the selected upload type."""
+
     try:
         logger.info(f"File upload api started : {value}")
         rows = await read_csv_file(file)
@@ -105,18 +109,28 @@ async def file_upload(db: AsyncSession = Depends(get_db),
     
 
 @router.get("/")
-async def invoices(db: AsyncSession = Depends(get_db),
-                current_user: User = Depends(get_current_user),
-                search: str | None = Query(None, description="Search by invoice number or party code or party name"),
-                priority: Optional[PriorityLevel] = Query(None, description="Filter by priority level (HIGH, MEDIUM, LOW)"),
-                page: int = Query(1, ge=1),
-                page_size: int = Query(10, ge=1, le=100)
-                ):
+async def invoices( type: FlowType,db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    search: str | None = Query(None, description="Search by invoice number or party code or party name"),
+    priority: Optional[PriorityLevel] = Query(None, description="Filter by priority level (HIGH, MEDIUM, LOW)"),
+    
+    from_date: str | None = Query(None, description="Format: DD-MM-YYYY"),
+    to_date: str | None = Query(None, description="Format: DD-MM-YYYY"),
+    is_verified: bool | None = Query(None, description="true = verified only, false = unverified only, none = unverified first then verified"),
+
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100)
+    ):
+    """Fetches paginated invoices for the authenticated user with search and filter support.
+    Allows filtering by priority, verification status, and date range, along with flexible text search.
+    Allows searching by invoice number or party code or party name
+    Returns total count, pagination info, and structured invoice data."""
+    
     try:
         logger.info("Invoices get api started")
         base_query = list_invoices_base_query()
         
-        rows,total = await invoices_apply_filters_search_pagination(db,base_query,search,priority,page,page_size)
+        rows,total = await invoices_apply_filters_search_pagination(type,db,base_query,search,priority,from_date,to_date,is_verified,page,page_size)
         
         if not rows:
             logger.error("Invoices data not found")
@@ -148,11 +162,16 @@ async def invoices(db: AsyncSession = Depends(get_db),
 
 @router.get("/{invoice_id}/products")
 async def invoices_products(invoice_id:str, 
+                type: FlowType,
                 rack_no: str | None = Query(None, description="Filter by rack_no"),
                 db: AsyncSession = Depends(get_db),
                 current_user: User = Depends(get_current_user),
                 page: int = Query(1, ge=1),
                 page_size: int = Query(10, ge=1, le=100)):
+    
+    """Retrieves paginated product line items for a specific invoice.
+    Supports optional filtering by rack number and applies alphabetical and priority-based sorting.
+    Returns invoice details along with total count and paginated product data."""
     
     try:
         logger.info("invoices_products api started")
@@ -164,14 +183,16 @@ async def invoices_products(invoice_id:str,
         
         invoice_details = await get_invoice_details(db, invoice_id)
         
-        base_query = list_invoices_products_base_query(rack_no=rack_no)
+        base_query = list_invoices_products_base_query(type,rack_no=rack_no)
         
         order_by = """
-            ORDER BY CASE inv.priority
-                        WHEN 'HIGH' THEN 1
-                        WHEN 'MEDIUM' THEN 2
-                        WHEN 'LOW' THEN 3
-                    END ASC, ip.id ASC
+            ORDER BY 
+                LOWER(ip.product_name) ASC,
+                CASE inv.priority
+                    WHEN 'HIGH' THEN 1
+                    WHEN 'MEDIUM' THEN 2
+                    WHEN 'LOW' THEN 3
+                END ASC
         """
         params = {"invoice_id": invoice_id}
         if rack_no:
@@ -206,6 +227,12 @@ async def invoices_products(invoice_id:str,
 @router.put("/{invoice_id}/priority") 
 async def invoice_priority(invoice_id:str,priority:PriorityLevel,db: AsyncSession = Depends(get_db),
                 current_user: User = Depends(get_current_user)) :
+    """
+        Updates the priority level of a specific invoice.
+        Validates invoice existence and maps priority enum (HIGH, MEDIUM, LOW) before updating.
+        Returns success message after updating the invoice priority.
+    """
+    
     try:
         invoice_check_query = "Select * from invoices where id = :invoice_id;"
         result = await db.execute(text(invoice_check_query),{"invoice_id":invoice_id})
@@ -245,6 +272,13 @@ async def invoice_metadata_update_view(invoice_id:str, data: InvoiceMetadataUpda
                 db: AsyncSession = Depends(get_db),
                 current_user: User = Depends(get_current_user)):
     
+    """ Updates invoice metadata timestamps (picker, checker, packer) and invoice status.
+        Validates invoice existence and updates only valid, non-duplicate *_start and *_end fields.
+        Updates the invoice status based on the provided metadata.
+        Triggers performance metrics computation when the invoice is marked as checking_end, picking_end, or completed
+        (i.e., when the Mark as Complete action is performed).
+    """
+    
     try:
         now_str = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
         exists = await check_invoice_exists(db, invoice_id)
@@ -272,7 +306,6 @@ async def invoice_metadata_update_view(invoice_id:str, data: InvoiceMetadataUpda
         await db.commit()
         logger.info(f"Invoice status and metadata added successfully")
         
-        
         if status_value in [
             InvoiceStatus.checking_end,
             InvoiceStatus.picking_end,
@@ -286,7 +319,7 @@ async def invoice_metadata_update_view(invoice_id:str, data: InvoiceMetadataUpda
                 logger.exception(f"Performance metrics failed for invoice {invoice_id}: {e}")
                 #  Do NOT rollback main transaction — only log failure
         
-        
+
         return {
             "status":"success",
             "message":f"Invoice status and metadata added successfully",
@@ -303,47 +336,55 @@ async def invoice_metadata_update_view(invoice_id:str, data: InvoiceMetadataUpda
         
 
 @router.post("/{invoice_id}/product")
-async def invoice_product_add_delete(invoice_id:str, 
+async def invoice_product_add_delete(invoice_id:str, type: FlowType,
                 data: InvoiceProductActionSchema, db: AsyncSession = Depends(get_db),
                 current_user: User = Depends(get_current_user)):
-        try:
-            if data.action not in ["add", "delete"]:
-                logger.exception("Invalid value, must be 'add' or 'delete'")
-                raise HTTPException(
-                    status_code=400,
-                    detail={"status": "error", "message": "Invalid value, must be 'add' or 'delete'"}
-                )
-                
-            exists = await check_invoice_exists(db, invoice_id)
-            if not exists:
-                logger.error(f"Invoice not found for invoice_id: {invoice_id}")
-                raise HTTPException(status_code=404, detail={"status" : "error",
-                "message" : f"Invoice not found for invoice_id: {invoice_id}"})
-                
-                
-            if data.action == "delete":
-                await delete_invoice_product(db,data.product_id)
-                logger.info(f"Productid: {data.product_id} deleted from invoice_product_list")
-                return {"status": "success", "message": "Product deleted successfully"}
+    """ 
+    Adds or deletes a product from a specific invoice based on the requested action.
+    Validates invoice existence and supports dynamic product creation with batch, expiry, quantity, rack, and scan status.
+    Formats expiry date and assigns rack number during product addition.
+    Supports safe deletion with proper validation and error handling.
+    """
+    try:
+        if data.action not in ["add", "delete"]:
+            logger.exception("Invalid value, must be 'add' or 'delete'")
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "error", "message": "Invalid value, must be 'add' or 'delete'"}
+            )
             
-            elif data.action == "add":
-                # Check if already exists
-                created = await add_invoice_product(db,invoice_id,data)
-                logger.info(f"Product added successfully to invoice: {invoice_id}")
-                return {"status": "success", "message": f"Product added successfully to invoice: {invoice_id}",
-                    "product":created}
+        exists = await check_invoice_exists(db, invoice_id)
+        if not exists:
+            logger.error(f"Invoice not found for invoice_id: {invoice_id}")
+            raise HTTPException(status_code=404, detail={"status" : "error",
+            "message" : f"Invoice not found for invoice_id: {invoice_id}"})
+            
+            
+        if data.action == "delete":
+            await delete_invoice_product(db,data.product_id)
+            logger.info(f"Productid: {data.product_id} deleted from invoice_product_list")
+            return {"status": "success", "message": "Product deleted successfully"}
+        
+        elif data.action == "add":
+            # Check if already exists
+            created = await add_invoice_product(db,invoice_id,data,type)
+            logger.info(f"Product added successfully to invoice: {invoice_id}")
+            return {"status": "success", "message": f"Product added successfully to invoice: {invoice_id}",
+                "product":created}
 
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception(f"Inside invoices_metadata_update_view api: {e}")
-            raise HTTPException(status_code=400, detail={"status" : "error",
-                    "message" : str(e).split("\n")[0][:100], "data":[]})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Inside invoices_metadata_update_view api: {e}")
+        raise HTTPException(status_code=400, detail={"status" : "error",
+                "message" : str(e).split("\n")[0][:100], "data":[]})
     
     
 @router.delete("/{invoice_id}")
 async def invoice_delete(invoice_id:str, db: AsyncSession = Depends(get_db),
-                current_user: User = Depends(get_current_user)):
+            current_user: User = Depends(get_current_user)):
+    """ Deletes an invoice along with its related invoice products and metadata.
+        Validates invoice existence before deletion and ensures transactional safety."""
     try:
         exists = await check_invoice_exists(db, invoice_id)
         if not exists:
@@ -387,6 +428,11 @@ async def invoice_delete(invoice_id:str, db: AsyncSession = Depends(get_db),
     
 @router.post("/transactions/add")
 async def transactions_add(data: TransactionAdd, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    
+    """ Records scan transactions for one or more products under a specific invoice.
+        Validates invoice and product existence before bulk inserting transaction records.
+        Stores operation type, status, scan status, image, and rack information per transaction."""
+    
     try:
         invoice_exists = await check_invoice_exists(db, data.invoice_id)
         if not invoice_exists:

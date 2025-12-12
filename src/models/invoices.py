@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, ForeignKey, Enum, Float, ARRAY, JSON, UniqueConstraint
+from sqlalchemy import Column, String, Boolean, Integer, ForeignKey, Enum, Float, ARRAY, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from src.db.database import Base
@@ -44,7 +44,7 @@ class Invoice(Base):
 
     # Possible values: not_started / picked / checked / packed / completed
     status = Column(Enum(InvoiceStatus), default="not_started", nullable=False)
-
+    is_completed = Column(Boolean, default=False, nullable=False)
     created_at = Column(
         String,
         default=lambda: datetime.now().strftime("%d-%m-%Y %H:%M:%S")
@@ -82,8 +82,12 @@ class InvoiceProductList(Base):
     expiry_date = Column(String, nullable=False)  # Format: MM-YYYY
     mrp = Column(Float, nullable=False)
     actual_qty = Column(Float, nullable=False, default=0.0)
-    scanned_qty = Column(Float, nullable=False, default=0.0)
-    scan_status = Column(Enum(ScanStatusEnum), nullable=True) 
+    # scanned_qty = Column(Float, nullable=False, default=0.0)
+    # scan_status = Column(Enum(ScanStatusEnum), nullable=True) 
+    picker_scanned_qty = Column(Float, nullable=True, default=0.0)
+    picker_scan_status = Column(Enum(ScanStatusEnum), nullable=True) 
+    checker_scanned_qty = Column(Float, nullable=True, default=0.0)
+    checker_scan_status = Column(Enum(ScanStatusEnum), nullable=True) 
     # Relationships
     invoice = relationship("Invoice", back_populates="invoice_products")
     # rack = relationship("RackMaster", back_populates="invoice_products", lazy="joined")

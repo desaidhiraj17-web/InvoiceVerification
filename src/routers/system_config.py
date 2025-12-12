@@ -19,6 +19,8 @@ router = APIRouter(tags=["System Config"])
 
 @router.get("/")
 async def get_settings(db: AsyncSession = Depends(get_db)):
+    """ Fetches the system configuration settings from the database.
+        Returns a single active configuration record. """
     try:
         logger.info("get settings api started")
 
@@ -45,6 +47,8 @@ async def get_settings(db: AsyncSession = Depends(get_db)):
 
 @router.put("/", response_model=dict)
 async def update_settings(data: SystemConfigUpdateSchema, db: AsyncSession = Depends(get_db)):
+    """ Updates the system configuration settings with only the provided fields.
+        Returns the updated configuration values upon successful modification. """
     try:
         logger.info("update settings api started")
 
@@ -103,7 +107,8 @@ async def health_view():
 
 @router.get("/generate-qr")
 async def generate_qr(request: Request,db: AsyncSession = Depends(get_db),current_user: User = Depends(get_current_user)):
-    
+    """ Generates a QR code containing the server IP address and port.
+        Returns the QR image as a PNG streaming response. """
     try:
         client_ip = request.client.host
         

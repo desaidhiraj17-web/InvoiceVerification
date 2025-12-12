@@ -108,27 +108,28 @@ async def central_login(credentials):
 
         if "status" not in data:
             logger.error("Invalid response from Central Server Login ERP API")
-            raise HTTPException(status_code=502, detail={"message":"Invalid response from ERP API: 'status' field missing"})
+            raise HTTPException(status_code=502, detail={"status":"error","message":"Invalid response from ERP API: 'status' field missing"})
 
         # Check the response body for success or failure
         if data.get("status") == "error":
             logger.error("Invalid credentials, Please use correct credentials")
-            raise HTTPException(status_code=404, detail={"message": "Invalid Credentials, Please use correct credentials ", "error_code": data.get("error")}
+            raise HTTPException(status_code=404, detail={"status":"error","message": "Invalid Credentials, Please use correct credentials ", "error_code": data.get("error")}
         )
         hashed_password = pwd_context.hash(credentials.password)
         
         inner_data = data.get("data")
         if not inner_data:
             logger.error("Missing data from central server : missing 'data' key")
-            raise HTTPException(status_code=502, detail={"message":"Invalid response: missing 'data' key"})
+            raise HTTPException(status_code=502, detail={"status":"error","message":"Invalid response: missing 'data' key"})
         
         provider = inner_data.get("provider")
         if not provider:
             logger.error("Missing data from central server : missing 'provider' key")
-            raise HTTPException(status_code=502, detail={"message":"Invalid response: missing 'provider' info"})
+            raise HTTPException(status_code=502, detail={"status":"error","message":"Invalid response: missing 'provider' info"})
         
         return (hashed_password, provider, data)
-    
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"From Central Login Function: {e}")
         raise HTTPException(status_code=400, detail={"status" : "error",
